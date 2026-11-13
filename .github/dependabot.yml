@@ -1,0 +1,22 @@
+# Keeps the actions in .github/workflows/ current.
+#
+# Every action in deploy.yml is pinned to a full commit SHA, and setup-uv
+# publishes no floating major tag. An exact pin is only safe while something
+# raises it. Without this config the pins freeze at whatever was current the
+# day they were written.
+#
+# The pandoc and typst versions are not here. site/install-toolchain.sh in
+# portolan-sdi/portolan-spec pins them, and that repo raises them.
+#
+# Directory / covers .github/workflows/ for this ecosystem.
+
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    # The org waits 7 days before it takes a release (norms/ci.md in
+    # portolan-ops), so a bad release has time to be pulled.
+    cooldown:
+      default-days: 7

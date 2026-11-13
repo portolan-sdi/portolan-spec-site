@@ -1,0 +1,168 @@
+name: Deploy
+
+# Builds the rendered Portolan specification and deploys it to
+# https://spec.portolan-sdi.org/. This repo holds no content and no build
+# code. Both live in portolan-sdi/portolan-spec under site/, and each run
+# checks out main there and builds every version from scratch.
+#
+# portolan-spec sends the spec-updated dispatch after a push to main or a
+# published release. The weekly run catches a dispatch that never arrived,
+# for example when the bot secret was missing.
+
+on:
+  repository_dispatch:
+    types: [spec-updated]
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One deploy at a time. A queued deploy waits for the running one instead
+# of cancelling it, so a deploy never stops half way.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  # renovate: datasource=pypi depName=uv
+  UV_VERSION: "0.13.6"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # The build renders each release and the next draft, with a PDF and an
+    # EPUB for each one.
+    timeout-minutes: 30
+    outputs:
+      versions: ${{ steps.versions.outputs.versions }}
+    steps:
+      # The payload is only a record. A dispatch can carry any text, so it
+      # reaches the shell through env and never through an expression.
+      - name: Record the trigger
+        env:
+          EVENT: ${{ github.event_name }}
+          SPEC_SHA: ${{ github.event.client_payload.spec_sha }}
+          SPEC_REF: ${{ github.event.client_payload.ref }}
+        run: |
+          {
+            echo "Event: $EVENT"
+            if [ "$EVENT" = repository_dispatch ]; then
+              echo "Requested by portolan-spec $SPEC_REF at $SPEC_SHA"
+            fi
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # Full history and tags, because the build renders every tag from
+      # v0.2.0 on. It always builds main, whatever the dispatch names.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: portolan-sdi/portolan-spec
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
+      # No cache in this workflow. Its output goes live, and a fresh
+      # install keeps a cache entry out of what it publishes.
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: false
+
+      - name: Install the toolchain
+        run: |
+          bash site/install-toolchain.sh "$RUNNER_TEMP/spec-site-toolchain"
+          echo "$RUNNER_TEMP/spec-site-toolchain/bin" >> "$GITHUB_PATH"
+
+      - name: Build every version
+        run: uv run --locked --script site/build.py --all --out _site
+
+      - name: Check the site
+        run: uv run --locked --script site/tests/check_site.py _site
+
+      # The deploy job checks each version after it goes live. It has no
+      # copy of _site, so this step passes the list on. Each name becomes
+      # part of a URL, so the step rejects any name outside a safe set.
+      - name: List the versions
+        id: versions
+        run: |
+          set -euo pipefail
+          versions=$(jq -c '[.[].version]' _site/versions.json)
+          if jq -e 'length == 0' <<< "$versions" > /dev/null; then
+            echo "::error::_site/versions.json lists no versions."
+            exit 1
+          fi
+          bad=$(jq -r '.[] | select(test("^[A-Za-z0-9._-]+$") | not)' \
+            <<< "$versions")
+          if [ -n "$bad" ]; then
+            echo "::error::Unsafe version names in versions.json: $bad"
+            exit 1
+          fi
+          echo "Versions: $versions"
+          echo "versions=$versions" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    # Up to 10 minutes for deploy-pages, plus up to 10 minutes of checks.
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      pages: write # Deploy to GitHub Pages, and read its settings
+      id-token: write # OIDC token that deploy-pages requires
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      # Fails when Pages is off or does not build from GitHub Actions.
+      - uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
+
+      # The check uses the canonical domain, not the page_url output. A
+      # broken custom domain then fails here instead of passing on the
+      # github.io address. The Pages CDN serves the old site for a few
+      # minutes after a deploy, so the step retries for up to 10 minutes.
+      - name: Verify the live site
+        env:
+          SITE_URL: https://spec.portolan-sdi.org
+          VERSIONS: ${{ needs.build.outputs.versions }}
+        run: |
+          set -euo pipefail
+          urls=("$SITE_URL/")
+          while read -r v; do
+            urls+=(
+              "$SITE_URL/$v/"
+              "$SITE_URL/$v/downloads/portolan-spec-$v.pdf"
+              "$SITE_URL/$v/downloads/portolan-spec-$v.epub"
+            )
+          done < <(jq -r '.[]' <<< "$VERSIONS")
+
+          deadline=$((SECONDS + 600))
+          while :; do
+            pending=()
+            for url in "${urls[@]}"; do
+              code=$(curl --silent --output /dev/null \
+                --write-out '%{http_code}' --max-time 30 "$url" || true)
+              if [ "$code" != 200 ]; then
+                pending+=("$code $url")
+              fi
+            done
+            if [ "${#pending[@]}" -eq 0 ]; then
+              echo "All ${#urls[@]} URLs return 200."
+              exit 0
+            fi
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "::error::These URLs did not return 200 within 10 minutes:"
+              printf '%s\n' "${pending[@]}"
+              exit 1
+            fi
+            echo "${#pending[@]} of ${#urls[@]} URLs not live yet. Retrying in 30 s."
+            sleep 30
+          done
